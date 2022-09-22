@@ -1,0 +1,7 @@
+.vscode
+guest-token.txt
+login-req.sh
+timbra-req.sh
+*.exe
+*.o
+scanner
