@@ -9,59 +9,30 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
 #include <netdb.h>
 #include <sys/wait.h>
-#include <sys/mman.h>
+#include <pthread.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include "scanner.h"
 
-#define DEFAULT_HOSTNAME "127.0.0.1"
-#define DEFAULT_PORT 443
-#define DEFAULT_CLIENTE "cliente1"
-#define DEFAULT_POST "post1"
-#define DEFAULT_TIPO "BARCODE"
-#define MSG_LEN 4096
+static open_devs_t od;
 
-#define MSG_FORMAT  "POST /api/v1/badges/archivio HTTP/1.1\r\n"             \
-                    "Host: %s\r\n"                                          \
-                    "guest-token: %s\r\n"                                   \
-                    "Content-Type: application/json; charset=utf-8\r\n"     \
-                    "Content-Length: %zd\r\n\r\n"                           \
-                    "%s"                                                
+static pthread_mutex_t scan_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t req_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t start_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-#define BODY_FORMAT "{\"barcode\":\"%s\","      \
-                    "\"cliente\":\"%s\","       \
-                    "\"postazione\":\"%s\","    \
-                    "\"tipo\":\"%s\"}"
-
-#define SERIAL_DIR "/dev/serial/by-id"
-#define SCAN_BUF_SIZE 32
-#define NDEVS 5
-#define DEVNAME_LEN 128
-
-#define SHM_NAME "open_devs"
-
-typedef struct open_devs_t {
-    char names[NDEVS][DEVNAME_LEN];
-    uint8_t size;
-} open_devs_t;
-
-typedef struct body_args_t {
-    char *cliente;
-    char *postazione;
-    char *tipo;
-    char *barcode;
-} body_args_t;
-
-void throw_err(char *msg);
-bool find_scanner(open_devs_t *od);
+void create_threads(pthread_t *threads, int *irets, tparams_t *tparams);
+void *thread_run(void *targs);
+void wait_threads(pthread_t *threads, int *irets);
+bool find_scanner(int n_thread);
 int connect_scanner(char *dev_name, struct termios *tio);
-int conn_to_server(const char *hostname, int port);
-SSL_CTX* init_CTX();
-void show_certs(SSL *ssl);
+int conn_to_server(const char *hostname, uint16_t port);
 
 int main(int argc, char *argv[]) {
-    if(argc < 2) throw_err("main | invalid arguments: token is missing");
+    printf("MAIN | Execution started.\n");
+
+    if(argc < 2) throw_err("MAIN | invalid arguments: token is missing");
 
     // get cmd args
     char *token = argv[1];
@@ -71,210 +42,279 @@ int main(int argc, char *argv[]) {
 
     body_args_t ba;
     ba.cliente = (argc >= 4 && strlen(argv[3]) > 0) ? argv[3] : DEFAULT_CLIENTE;
-    ba.postazione = (argc >= 4 && strlen(argv[3]) > 0) ? argv[3] : DEFAULT_CLIENTE;
+    ba.postazione = (argc >= 5 && strlen(argv[4]) > 0) ? argv[4] : DEFAULT_CLIENTE;
     ba.tipo = (argc >= 6 && strlen(argv[5]) > 0) ? argv[5] : DEFAULT_TIPO;
-    char scan_buf[SCAN_BUF_SIZE];
-    ba.barcode = scan_buf;
+    ba.barcode = NULL;
 
+    int body_len = strlen(BODY_FORMAT) + strlen(ba.cliente) +
+                   strlen(ba.postazione) + strlen(ba.tipo) + SCAN_BUF_SIZE;
+    int req_len =
+        strlen(MSG_FORMAT) + body_len + strlen(hostname) + strlen(token);
+    
     /*#################################################################################################################*/
 
     SSL_library_init();
 
     SSL_CTX *ctx = init_CTX();
+
     // connect to server
     int client_fd = conn_to_server(hostname, port);
+    printf("MAIN | Connection to %s:%d enstablished.\n", hostname, port);
+
     // make ssl connection
     SSL *ssl = SSL_new(ctx);
     SSL_set_fd(ssl, client_fd);
-    if(SSL_connect(ssl) == -1) {
+    if(SSL_connect(ssl) == INVALID_FD) {
         ERR_print_errors_fp(stderr);
-        throw_err("main | SSL_connect");
+        throw_err("MAIN | SSL_connect");
     }
 
-    printf("SSL connection enstablished.\n");
+    printf("MAIN | SSL connection enstablished.\n");
 
     show_certs(ssl);
 
     /*#################################################################################################################*/
 
-    struct termios tio;
-    int scan_fd;
-
-    ssize_t read_scan;
-
-    // open_devs shared memory
-    size_t od_size = sizeof(open_devs_t);
-
-    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
-    if(shm_fd == -1) throw_err("main | shm_open");
-
-    if(ftruncate(shm_fd, od_size) == -1) throw_err("main | ftruncate");
-
-    open_devs_t *od =
-        mmap(NULL, od_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if(od == MAP_FAILED) throw_err("main | mmap");
-
-    /*#################################################################################################################*/
-
-    int body_len = strlen(BODY_FORMAT) + strlen(ba.cliente) +
-                   strlen(ba.postazione) + strlen(ba.tipo) + SCAN_BUF_SIZE;
-    int req_len =
-        strlen(MSG_FORMAT) + body_len + strlen(hostname) + strlen(argv[1]);
-
-    char request[req_len], response[MSG_LEN], body_msg[body_len];
+    // init open_devs
+    bzero(od, sizeof(od));
     
-    int nbytes;
+    // params for threads
+    tparams_t tparams;
+    tparams.ba = &ba;
+    tparams.body_len = body_len;
+    tparams.hostname = hostname;
+    tparams.req_len = req_len;
+    tparams.ssl = ssl;
+    tparams.token = token;
+    tparams.n_thread = 0;
+
+    pthread_t threads[NDEVS];
+    int irets[NDEVS];
+
+    // create threads
+    create_threads(threads, irets, &tparams);
+
+    // wait for threads to terminate
+    printf("MAIN | Wait for threads to terminate.\n");
+    wait_threads(threads, irets);
 
     /*#################################################################################################################*/
-
-    pid_t pid;
-
-    while(true) {
-        // find available scanner device
-        if(!find_scanner(od)) {
-            waitpid(0, NULL, WNOHANG);
-            sleep(5);
-            continue;
-        }
-
-        printf("Scanner device found: %s.\n", od->names[od->size]);
-
-        // create a subprocess for each device
-        if((pid = fork()) == 0) {
-            // connect device
-            if((scan_fd = connect_scanner(od->names[od->size], &tio)) == -1) {
-                od->size--;
-                SSL_free(ssl);
-                close(client_fd);
-                SSL_CTX_free(ctx);
-                throw_err("main | connect_scanner");
-            }
-
-            /*#################################################################################################################*/
-
-            while(true) {
-                // get barcode
-                while((read_scan = read(scan_fd, scan_buf, sizeof(scan_buf))));
-                if(!read_scan) {
-                    fprintf(stderr, "Scanner has been unplugged.\n");
-                    break;
-                }
-
-                // create msg request
-                snprintf(body_msg, sizeof(body_msg), BODY_FORMAT, ba.barcode,
-                    ba.cliente, ba.postazione, ba.tipo);
-                snprintf(request, sizeof(request), MSG_FORMAT, hostname, token,
-                    strlen(body_msg), body_msg);
-
-                printf("-------------------------------------------------------------"
-                    "--------------------------------------\n");
-                printf("%s\n", request);
-                printf("-------------------------------------------------------------"
-                    "--------------------------------------\n");
-
-                // send request
-                if(SSL_write(ssl, request, strlen(request)) <= 0) {
-                    ERR_print_errors_fp(stderr);
-                    fprintf(stderr, "Unable to send request.\n");
-                    break;
-                }
-
-                // recive response
-                if((nbytes = SSL_read(ssl, response, sizeof(response))) <= 0) {
-                    ERR_print_errors_fp(stderr);
-                    fprintf(stderr, "No response.\n");
-                    break;
-                }
-                response[nbytes] = 0;
-
-                printf("%s\n", response);
-            }
-
-            od->size--;
-
-            close(scan_fd);
-            SSL_free(ssl);
-            close(client_fd);
-            SSL_CTX_free(ctx);
-
-            /*#################################################################################################################*/
-
-            exit(EXIT_SUCCESS);
-        }
-        else if (pid == -1) {
-            od->size--;
-            throw_err("main | fork"); 
-        }
-
-        waitpid(0, NULL, WNOHANG);
-        sleep(5);
-    }
 
     SSL_free(ssl);
     close(client_fd);
     SSL_CTX_free(ctx);
 
+    printf("MAIN | Execution terminated.\n");
+
     return EXIT_SUCCESS;
 }
 
-void throw_err(char *msg) {
+void create_threads(pthread_t *threads, int *irets, tparams_t *tparams) {
+    pthread_mutex_lock(&start_mutex);
+    for(int i=0; i<NDEVS; i++) {
+        if((irets[i] = pthread_create(&threads[i], NULL, thread_run,(void *)tparams)))
+            throw_err("create_threads | pthread_create");
+        printf("MAIN | Created THREAD %d.\n", i);
+        pthread_mutex_lock(&start_mutex);
+        tparams->n_thread++;
+    }
+}
+
+void wait_threads(pthread_t *threads, int *irets) {
+    for(int i=0; i<NDEVS; i++) {
+        pthread_join(threads[i], NULL);
+        printf("MAIN | THREAD %d returns: %d.\n", i, irets[i]);
+    }
+}
+
+void *thread_run(void *targs) {
+    // gather thread params
+    tparams_t *tparams = (tparams_t *)targs;
+
+    int n_thread = tparams->n_thread;
+
+    printf("THREAD %d | Execution started.\n", n_thread);
+
+    pthread_mutex_unlock(&start_mutex);
+
+    body_args_t *ba = tparams->ba;
+
+    const char *token = tparams->token;
+    const char *hostname = tparams->hostname;
+
+    SSL *ssl = tparams->ssl;
+
+    int body_len = tparams->body_len;
+    int req_len = tparams->req_len;
+
+    /*#################################################################################################################*/
+
+    struct termios tio;
+    int scan_fd;
+    ssize_t read_scan;
+
+    char request[req_len], response[MSG_LEN], body_msg[body_len], scan_buf[SCAN_BUF_SIZE];
+    int nbytes;
+
+    while(true) {
+        if(!od[n_thread].open) {
+            pthread_mutex_lock(&scan_mutex);
+
+            // search for an available scanner device
+            if(!find_scanner(n_thread)) {
+                od[n_thread].open = false;
+                // fprintf(stderr, RED "THREAD %d | Scanner not found.\n" RESET, n_thread);
+                pthread_mutex_unlock(&scan_mutex);
+                sleep(5);
+                continue;
+            }
+
+            printf("THREAD %d | Available scanner device %s has been found.\n", n_thread, od[n_thread].pathname);
+
+            // connetc serial scanner
+            if((scan_fd = connect_scanner(od[n_thread].pathname, &tio)) == INVALID_FD) {
+                fprintf(stderr, RED "THREAD %d | Failed to open scanner %s.\n" RESET, n_thread, od[n_thread].pathname);
+                close(scan_fd);
+                od[n_thread].open = false;
+                pthread_mutex_unlock(&scan_mutex);
+                sleep(5);
+                continue;
+            }
+
+            printf("THREAD %d | Scanner %s has been connected.\n", n_thread, od[n_thread].pathname);
+
+            pthread_mutex_unlock(&scan_mutex);
+        }
+
+        // get barcode
+        printf("THREAD %d | Waiting for scanner input.\n", n_thread);
+        while((read_scan = read(scan_fd, scan_buf, sizeof(scan_buf))) < 0);
+        if (!read_scan) {
+            fprintf(stderr, RED "THREAD %d | Scanner %s has been unplugged.\n" RESET, n_thread, od[n_thread].pathname);
+            close(scan_fd);
+            od[n_thread].open = false;
+            continue;
+        }
+
+        // create msg request
+        snprintf(body_msg, sizeof(body_msg), BODY_FORMAT, scan_buf,
+                 ba->cliente, ba->postazione, ba->tipo);
+        snprintf(request, sizeof(request), MSG_FORMAT, hostname, token,
+                 strlen(body_msg), body_msg);
+
+        pthread_mutex_lock(&req_mutex);
+
+        printf("-------------------------------------------------------------"
+               "--------------------------------------\n");
+        printf("%s\n", request);
+        printf("-------------------------------------------------------------"
+               "--------------------------------------\n");
+
+        // send request
+        if (SSL_write(ssl, request, strlen(request)) <= 0)
+        {
+            ERR_print_errors_fp(stderr);
+            fprintf(stderr, RED "THREAD %d | SSL_write: Unable to send request.\n" RESET, n_thread);
+            pthread_mutex_unlock(&req_mutex);
+            break;
+        }
+
+        // recive response
+        if ((nbytes = SSL_read(ssl, response, sizeof(response))) <= 0)
+        {
+            ERR_print_errors_fp(stderr);
+            fprintf(stderr, RED "THREAD %d | SSL_read: No response.\n" RESET, n_thread);
+            pthread_mutex_unlock(&req_mutex);
+            break;
+        }
+        response[nbytes] = 0;
+
+        printf("%s\n", response);
+
+        pthread_mutex_unlock(&req_mutex);
+    }
+
+    close(scan_fd);
+    od[n_thread].open = false;
+    printf("THREAD %d | Execution terminated.\n", n_thread);
+
+    return NULL;
+}
+
+void throw_err(const char *msg) {
+    if(!errno) {
+        fprintf(stderr, RED "%s\n" RESET, msg);
+        exit(EXIT_FAILURE);
+    }
+    
+    fprintf(stderr, RED);
     perror(msg);
-    if(!errno) exit(EXIT_FAILURE);
+    fprintf(stderr, RESET);
     exit(errno);
 }
 
-bool find_scanner(open_devs_t *od) {
-    // max num of devices connected reached
-    if(od->size >= NDEVS) return false;
-
+bool find_scanner(int n_thread) {
     DIR *dp;
     struct dirent *dir;
     char dev_found[DEVNAME_LEN];
+    bool is_open = false;
 
     // open serial devices directory
     if((dp = opendir(SERIAL_DIR)) == NULL) {
         fprintf(stderr,
-              "Can't open serial devices directory: no device detected.\n");
+              RED "Can't open serial devices directory: no device detected.\n" RESET);
         closedir(dp);
         return false;
     }
 
     // search for a serial device
     while((dir = readdir(dp)) != NULL) {
-        // not a file: fail
-        if(dir->d_type == DT_DIR) continue;
+        // not a char file: fail
+        if(dir->d_type != DT_LNK) continue;
 
-        for(int i=0; i<od->size; i++) {
-            // get device full path
-            sprintf(dev_found, "%s/%s", SERIAL_DIR, dir->d_name);
+        // get device full path
+        snprintf(dev_found, sizeof(dev_found), "%s/%s", SERIAL_DIR, dir->d_name);
 
-            // device not already opened
-            if(strcmp(dir->d_name, od->names[i])) {
-                strcpy(od->names[od->size++], dev_found);
-                closedir(dp);
-                return true;
+        is_open = false;
+
+        for(int i=0; i<NDEVS; i++) {
+            if(!od[i].open || i == n_thread) continue;
+
+            // device already opened
+            if(!strcmp(dev_found, od[i].pathname)) {
+                is_open = true;
+                break;
             }
+        }
+
+        // device not already opened has been found
+        if(!is_open) {
+            strcpy(od[n_thread].pathname, dev_found);
+            od[n_thread].open = true;
+            closedir(dp);
+            return true;
         }
     }
 
     closedir(dp);
+    od[n_thread].open = false;
     return false;
 }
 
 int connect_scanner(char *dev_name, struct termios *tio) {
     // open device on non-blocking read-only
     int fd;
-    if((fd = open(dev_name, O_RDONLY | O_NONBLOCK)) == -1) {
+    if((fd = open(dev_name, O_RDONLY | O_NONBLOCK)) == INVALID_FD) {
         perror("connect_scanner | open");
         close(fd);
-        return -1;
+        return INVALID_FD;
     }
 
     // device must be a tty
     if(!isatty(fd)) {
-        fprintf(stderr, "connect_scanner | not a tty");
+        fprintf(stderr, RED "connect_scanner | not a tty" RESET);
         close(fd);
-        return -1;
+        return INVALID_FD;
     }
 
     // serial device setup
@@ -292,12 +332,12 @@ int connect_scanner(char *dev_name, struct termios *tio) {
  
     tcsetattr(fd,TCSANOW,tio);
 
-    printf("Serial device %s connected.\n", dev_name);
+    // printf("Serial device %s connected.\n", dev_name);
 
     return fd;
 }
 
-int conn_to_server(const char *hostname, int port) {
+int conn_to_server(const char *hostname, uint16_t port) {
     int sd;
     struct hostent *host;
     struct sockaddr_in addr;
@@ -307,7 +347,7 @@ int conn_to_server(const char *hostname, int port) {
         throw_err("conn_to_server | gethostbyname");
 
     // create socket
-    if((sd = socket(PF_INET, SOCK_STREAM, 0)) == -1)
+    if((sd = socket(PF_INET, SOCK_STREAM, 0)) == INVALID_FD)
         throw_err("conn_to_server | socket");
     
     bzero(&addr, sizeof(addr));
@@ -322,7 +362,7 @@ int conn_to_server(const char *hostname, int port) {
     while(connect(sd, (struct sockaddr*)&addr, sizeof(addr)))
         sleep(1);
 
-    printf("Connection to %s:%d enstablished.\n", hostname, port);
+    // printf("Connection to %s:%d enstablished.\n", hostname, port);
 
     return sd;
 }
